@@ -56,10 +56,10 @@ async def init_db():
                 name TEXT,
                 season INTEGER,
                 episode INTEGER,
-                file_id TEXT
+                file_id TEXT,
+                UNIQUE(code, season, episode)
             )
         """)
-        # Foydalanuvchi baholari uchun jadval
         await db.execute("""
             CREATE TABLE IF NOT EXISTS movie_ratings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,7 +276,6 @@ async def top_movies_handler(message: types.Message):
             
             await message.answer(text, parse_mode="Markdown")
 
-# Kinolar ro'yxati
 @dp.message(F.text.in_(["🎬 Kinolar", "🎬 Barcha Kinolar"]))
 async def list_movies(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -296,7 +295,6 @@ async def list_movies(message: types.Message):
                 text += f"🍿 **{name}**\n├ Janr: {genre}\n├ IMDb: ⭐ {rating}\n├ Vaqti: ⏳ {duration}\n└ Kodi: 🔑 `{code}`\n\n"
             await message.answer(text, parse_mode="Markdown")
 
-# Seriallar ro'yxati
 @dp.message(F.text.in_(["📺 Seriallar", "📺 Barcha Seriallar"]))
 async def list_series(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -317,7 +315,7 @@ async def list_series(message: types.Message):
             text += "\n*Qismlarni ko'rish uchun serial kodini chatga yuboring.*"
             await message.answer(text, parse_mode="Markdown")
 
-# --- RATING CALLBACK (FOYDALANUVCHI BAHOSI) ---
+# --- RATING CALLBACK ---
 @dp.callback_query(F.data.startswith("rate_"))
 async def handle_rating(callback: types.CallbackQuery):
     parts = callback.data.split("_")
@@ -412,7 +410,7 @@ async def del_channel_finish(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Kanal o'chirildi!", reply_markup=get_admin_keyboard())
 
-# --- ADMIN: KONTENT QO'SHISH VA O'CHIRISH ---
+# --- ADMIN: KONTENT QO'SHISH (TAKRORLANISHNI TEKSHIRISH BILAN) ---
 @dp.message(F.text == "➕ Qo'shish", F.from_user.id == ADMIN_ID)
 async def add_choice(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -427,8 +425,31 @@ async def start_add_movie(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Kino uchun kod kiriting (masalan: `10`):", reply_markup=get_cancel_kb())
 
 @dp.message(AddMovieState.code)
-async def step_m_name(message: types.Message, state: FSMContext):
-    await state.update_data(code=message.text.strip())
+async def step_m_code_check(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    
+    # Baza tekshiruvi: ushbu kod kinolar yoki seriallarda bormi?
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT name FROM movies WHERE code = ?", (code,)) as cur1:
+            existing_movie = await cur1.fetchone()
+        async with db.execute("SELECT name FROM series WHERE code = ?", (code,)) as cur2:
+            existing_series = await cur2.fetchone()
+
+    if existing_movie:
+        await message.answer(
+            f"⚠️ **Xatolik!** Bu `{code}` kodi allaqachon **\"{existing_movie[0]}\"** kinosiga berilgan.\n\nIltimos, boshqa kod kiriting:",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if existing_series:
+        await message.answer(
+            f"⚠️ **Xatolik!** Bu `{code}` kodi allaqachon **\"{existing_series[0]}\"** serialiga berilgan.\n\nIltimos, boshqa kod kiriting:",
+            parse_mode="Markdown"
+        )
+        return
+
+    await state.update_data(code=code)
     await state.set_state(AddMovieState.name)
     await message.answer("Kino nomini kiriting:")
 
@@ -461,21 +482,36 @@ async def finish_add_movie(message: types.Message, state: FSMContext):
     data = await state.get_data()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO movies (code, name, genre, rating, duration, file_id) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO movies (code, name, genre, rating, duration, file_id) VALUES (?, ?, ?, ?, ?, ?)",
             (data['code'], data['name'], data['genre'], data['rating'], data['duration'], message.video.file_id)
         )
         await db.commit()
     await state.clear()
     await message.answer("✅ Kino muvaffaqiyatli saqlandi!", reply_markup=get_admin_keyboard())
 
+# --- SERIAL QO'SHISH ---
 @dp.callback_query(F.data == "add_type_series")
 async def start_add_series(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddSeriesState.code)
     await callback.message.answer("Serial kodini kiriting (masalan: `mrrobot` yoki `20`):", reply_markup=get_cancel_kb())
 
 @dp.message(AddSeriesState.code)
-async def step_s_name(message: types.Message, state: FSMContext):
-    await state.update_data(code=message.text.strip())
+async def step_s_code_check(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    
+    # Kinolar bilan to'qnashuvni tekshirish
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT name FROM movies WHERE code = ?", (code,)) as cur:
+            existing_movie = await cur.fetchone()
+
+    if existing_movie:
+        await message.answer(
+            f"⚠️ **Xatolik!** Bu `{code}` kodi allaqachon **\"{existing_movie[0]}\"** kinosiga berilgan.\n\nIltimos, boshqa kod kiriting:",
+            parse_mode="Markdown"
+        )
+        return
+
+    await state.update_data(code=code)
     await state.set_state(AddSeriesState.name)
     await message.answer("Serial nomini kiriting:")
 
@@ -483,19 +519,38 @@ async def step_s_name(message: types.Message, state: FSMContext):
 async def step_s_season(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AddSeriesState.season)
-    await message.answer("Fasl (Season) raqamini kiriting:")
+    await message.answer("Fasl (Season) raqamini kiriting (masalan: `1`):")
 
 @dp.message(AddSeriesState.season)
 async def step_s_ep(message: types.Message, state: FSMContext):
-    await state.update_data(season=int(message.text.strip()))
-    await state.set_state(AddSeriesState.episode)
-    await message.answer("Qism (Episode) raqamini kiriting:")
+    try:
+        season = int(message.text.strip())
+        await state.update_data(season=season)
+        await state.set_state(AddSeriesState.episode)
+        await message.answer("Qism (Episode) raqamini kiriting (masalan: `1`):")
+    except ValueError:
+        await message.answer("Iltimos, fasl raqamini faqat son shaklida kiriting!")
 
 @dp.message(AddSeriesState.episode)
 async def step_s_file(message: types.Message, state: FSMContext):
-    await state.update_data(episode=int(message.text.strip()))
-    await state.set_state(AddSeriesState.video)
-    await message.answer("Qism videosini yuboring:")
+    try:
+        episode = int(message.text.strip())
+        data = await state.get_data()
+        
+        # Ushbu fasl va qism oldin yuklanganmi tekshirish
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT id FROM series WHERE code = ? AND season = ? AND episode = ?", (data['code'], data['season'], episode)) as cur:
+                exists = await cur.fetchone()
+        
+        if exists:
+            await message.answer(f"⚠️ Bu serialning {data['season']}-fasl {episode}-qismi allaqachon mavjud! Boshqa qism raqamini kiriting:")
+            return
+
+        await state.update_data(episode=episode)
+        await state.set_state(AddSeriesState.video)
+        await message.answer("Qism videosini yuboring:")
+    except ValueError:
+        await message.answer("Iltimos, qism raqamini faqat son shaklida kiriting!")
 
 @dp.message(AddSeriesState.video, F.video)
 async def finish_add_series(message: types.Message, state: FSMContext):
@@ -507,8 +562,9 @@ async def finish_add_series(message: types.Message, state: FSMContext):
         )
         await db.commit()
     await state.clear()
-    await message.answer("✅ Serial qismi muvaffaqiyatli saqlandi!", reply_markup=get_admin_keyboard())
+    await message.answer(f"✅ \"{data['name']}\" ({data['season']}-fasl, {data['episode']}-qism) saqlandi!", reply_markup=get_admin_keyboard())
 
+# --- O'CHIRISH ---
 @dp.message(F.text == "🗑 O'chirish", F.from_user.id == ADMIN_ID)
 async def delete_content_start(message: types.Message, state: FSMContext):
     await state.set_state(DeleteContentState.code)
@@ -540,7 +596,6 @@ async def search_handler(message: types.Message):
             if movie:
                 name, genre, rating, duration, file_id = movie
                 
-                # Foydalanuvchilar reytingini hisoblash
                 async with db.execute("SELECT AVG(stars), COUNT(id) FROM movie_ratings WHERE code = ?", (code,)) as r_cur:
                     r_data = await r_cur.fetchone()
                     avg_stars = f"{r_data[0]:.1f} ⭐ ({r_data[1]} ta ovoz)" if r_data and r_data[0] else "Hali baholanmagan"
@@ -606,7 +661,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- BOTNI ISHGA TUSHIRISH ---
+# --- ISHGA TUSHIRISH ---
 async def main():
     await init_db()
     await start_web_server()
