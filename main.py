@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 import aiosqlite
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -58,6 +59,16 @@ async def init_db():
                 file_id TEXT
             )
         """)
+        # Foydalanuvchi baholari uchun jadval
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS movie_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                code TEXT,
+                stars INTEGER,
+                UNIQUE(user_id, code)
+            )
+        """)
         await db.commit()
 
 # --- FSM STATES ---
@@ -91,7 +102,8 @@ class DeleteChannelState(StatesGroup):
 def get_user_keyboard():
     kb = [
         [KeyboardButton(text="🎬 Barcha Kinolar"), KeyboardButton(text="📺 Barcha Seriallar")],
-        [KeyboardButton(text="ℹ️ Qanday qidiriladi?")]
+        [KeyboardButton(text="🎲 Tasodifiy kino"), KeyboardButton(text="🔥 TOP Kinolar")],
+        [KeyboardButton(text="ℹ️ Bot haqida va qo'llanma")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -109,6 +121,18 @@ def get_cancel_kb():
         keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
         resize_keyboard=True
     )
+
+def get_rating_inline_kb(code: str):
+    kb = [
+        [
+            InlineKeyboardButton(text="⭐ 1", callback_data=f"rate_{code}_1"),
+            InlineKeyboardButton(text="⭐ 2", callback_data=f"rate_{code}_2"),
+            InlineKeyboardButton(text="⭐ 3", callback_data=f"rate_{code}_3"),
+            InlineKeyboardButton(text="⭐ 4", callback_data=f"rate_{code}_4"),
+            InlineKeyboardButton(text="⭐ 5", callback_data=f"rate_{code}_5")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # --- MAJBURIY OBUNA TEKSHIRUVI ---
 async def check_subscription(user_id: int) -> tuple[bool, list]:
@@ -153,7 +177,7 @@ async def start_handler(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer(
-            "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
+            "⚠️ Botdan to'liq foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
             reply_markup=get_sub_inline_kb(unsub_channels)
         )
         return
@@ -162,7 +186,8 @@ async def start_handler(message: types.Message):
         await message.answer("👋 Assalomu alaykum, Admin! Boshqaruv paneli:", reply_markup=get_admin_keyboard())
     else:
         await message.answer(
-            "👋 **CinemaNova botiga xush kelibsiz!**\n\nKino yoki serial kodini yuboring yoki quyidagi tugmalardan birini tanlang.",
+            "👋 **CinemaNova botiga xush kelibsiz!**\n\n"
+            "🔍 Kino yoki serial kodini yuboring yoki quyidagi tugmalardan foydalaning:",
             reply_markup=get_user_keyboard(),
             parse_mode="Markdown"
         )
@@ -179,18 +204,79 @@ async def check_sub_callback(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
 
-# --- USER TUGMALARI ---
-@dp.message(F.text == "ℹ️ Qanday qidiriladi?")
-async def help_handler(message: types.Message):
-    await message.answer(
-        "🔎 **Kino qidirish tartibi:**\n\n"
-        "1. Shunchaki kino yoki serial kodini (masalan: `10`) botga yuboring.\n"
-        "2. Agar kod topilsa, bot sizga kinoni yoki serial qismlari ro'yxatini chiqaradi.\n"
-        "3. Kodlarni bilish uchun **🎬 Barcha Kinolar** yoki **📺 Barcha Seriallar** tugmasini bosing.",
-        parse_mode="Markdown"
+# --- USER TUGMALARI VA FUNKSIYALARI ---
+@dp.message(F.text == "ℹ️ Bot haqida va qo'llanma")
+async def info_handler(message: types.Message):
+    text = (
+        "📖 **CinemaNova Bot Qo'llanmasi:**\n\n"
+        "1. **Kino qidirish:** Kinoning kodini (masalan: `10`) yozib yuborsangiz, bot darhol videoni chiqarib beradi.\n"
+        "2. **Serial ko'rish:** Serial kodini yuborsangiz, barcha fasl va qismlari tugmalar ko'rinishida chiqadi.\n"
+        "3. **Baholash:** Har bir kinoni ko'rib bo'lgach, tagidagi ⭐ tugmalar orqali baho berishingiz mumkin.\n"
+        "4. **Ro'yxatlar:** **🎬 Barcha Kinolar** tugmasi orqali mavjud barcha filmlar kodlarini ko'rishingiz mumkin."
     )
+    await message.answer(text, parse_mode="Markdown")
 
-# --- KINOLAR RO'YXATI (HAMMA UCHUN) ---
+@dp.message(F.text == "🎲 Tasodifiy kino")
+async def random_movie_handler(message: types.Message):
+    is_sub, unsub_channels = await check_subscription(message.from_user.id)
+    if not is_sub:
+        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT code, name, genre, rating, duration, file_id FROM movies") as cursor:
+            movies = await cursor.fetchall()
+            if not movies:
+                await message.answer("Bazada kinolar mavjud emas.")
+                return
+            
+            movie = random.choice(movies)
+            code, name, genre, rating, duration, file_id = movie
+            caption = (
+                f"🎲 **Tasodifiy tanlangan kino:**\n\n"
+                f"🎬 **{name}**\n"
+                f"🎭 Janr: {genre}\n"
+                f"⭐ IMDb Reyting: {rating}\n"
+                f"⏳ Davomiyligi: {duration}\n"
+                f"🔑 Kodi: `{code}`\n\n"
+                f"👇 *Kinoni baholang:*"
+            )
+            await message.answer_video(
+                video=file_id, 
+                caption=caption, 
+                reply_markup=get_rating_inline_kb(code),
+                parse_mode="Markdown"
+            )
+
+@dp.message(F.text == "🔥 TOP Kinolar")
+async def top_movies_handler(message: types.Message):
+    is_sub, unsub_channels = await check_subscription(message.from_user.id)
+    if not is_sub:
+        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = """
+            SELECT m.code, m.name, AVG(r.stars) as avg_rating, COUNT(r.id) as votes
+            FROM movies m
+            JOIN movie_ratings r ON m.code = r.code
+            GROUP BY m.code
+            ORDER BY avg_rating DESC, votes DESC
+            LIMIT 5
+        """
+        async with db.execute(query) as cursor:
+            top_list = await cursor.fetchall()
+            if not top_list:
+                await message.answer("🔥 Hozircha foydalanuvchilar tomonidan baholangan TOP kinolar mavjud emas.")
+                return
+            
+            text = "🔥 **Foydalanuvchilar e'tirofiga ko'ra TOP kinolar:**\n\n"
+            for idx, (code, name, avg_rate, votes) in enumerate(top_list, 1):
+                text += f"{idx}. **{name}** — ⭐ {avg_rate:.1f} ({votes} ta ovoz) | Kodi: `{code}`\n"
+            
+            await message.answer(text, parse_mode="Markdown")
+
+# Kinolar ro'yxati
 @dp.message(F.text.in_(["🎬 Kinolar", "🎬 Barcha Kinolar"]))
 async def list_movies(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -207,10 +293,10 @@ async def list_movies(message: types.Message):
             
             text = "🎬 **Mavjud kinolar ro'yxati:**\n\n"
             for code, name, genre, rating, duration in movies:
-                text += f"🍿 **{name}**\n├ Janr: {genre}\n├ Reyting: ⭐ {rating}\n├ Vaqti: ⏳ {duration}\n└ Kodi: 🔑 `{code}`\n\n"
+                text += f"🍿 **{name}**\n├ Janr: {genre}\n├ IMDb: ⭐ {rating}\n├ Vaqti: ⏳ {duration}\n└ Kodi: 🔑 `{code}`\n\n"
             await message.answer(text, parse_mode="Markdown")
 
-# --- SERIALLAR RO'YXATI (HAMMA UCHUN) ---
+# Seriallar ro'yxati
 @dp.message(F.text.in_(["📺 Seriallar", "📺 Barcha Seriallar"]))
 async def list_series(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -231,7 +317,25 @@ async def list_series(message: types.Message):
             text += "\n*Qismlarni ko'rish uchun serial kodini chatga yuboring.*"
             await message.answer(text, parse_mode="Markdown")
 
-# --- ADMIN: STATISTIKA ---
+# --- RATING CALLBACK (FOYDALANUVCHI BAHOSI) ---
+@dp.callback_query(F.data.startswith("rate_"))
+async def handle_rating(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    code = parts[1]
+    stars = int(parts[2])
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO movie_ratings (user_id, code, stars)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, code) DO UPDATE SET stars=excluded.stars
+        """, (user_id, code, stars))
+        await db.commit()
+    
+    await callback.answer(f"Rahmat! Siz ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
+
+# --- ADMIN: STATISTIKA VA KANALLAR ---
 @dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
 async def stats_handler(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -249,7 +353,6 @@ async def stats_handler(message: types.Message):
         f"📺 Seriallar soni: {series_count}"
     )
 
-# --- ADMIN: KANALLARNI BOSHQARISH ---
 @dp.message(F.text == "📝 Kanallar ro'yxati", F.from_user.id == ADMIN_ID)
 async def list_channels(message: types.Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -431,20 +534,35 @@ async def search_handler(message: types.Message):
 
     code = message.text.strip()
     async with aiosqlite.connect(DB_NAME) as db:
+        # Kinolardan izlash
         async with db.execute("SELECT name, genre, rating, duration, file_id FROM movies WHERE code = ?", (code,)) as cursor:
             movie = await cursor.fetchone()
             if movie:
                 name, genre, rating, duration, file_id = movie
+                
+                # Foydalanuvchilar reytingini hisoblash
+                async with db.execute("SELECT AVG(stars), COUNT(id) FROM movie_ratings WHERE code = ?", (code,)) as r_cur:
+                    r_data = await r_cur.fetchone()
+                    avg_stars = f"{r_data[0]:.1f} ⭐ ({r_data[1]} ta ovoz)" if r_data and r_data[0] else "Hali baholanmagan"
+
                 caption = (
                     f"🎬 **{name}**\n\n"
                     f"🎭 Janr: {genre}\n"
-                    f"⭐ Reyting: {rating}\n"
+                    f"⭐ IMDb: {rating}\n"
+                    f"👥 Foydalanuvchilar bahosi: {avg_stars}\n"
                     f"⏳ Davomiyligi: {duration}\n"
-                    f"🔑 Kodi: `{code}`"
+                    f"🔑 Kodi: `{code}`\n\n"
+                    f"👇 *Kinoga baho bering:*"
                 )
-                await message.answer_video(video=file_id, caption=caption, parse_mode="Markdown")
+                await message.answer_video(
+                    video=file_id, 
+                    caption=caption, 
+                    reply_markup=get_rating_inline_kb(code),
+                    parse_mode="Markdown"
+                )
                 return
 
+        # Seriallardan izlash
         async with db.execute("SELECT id, name, season, episode FROM series WHERE code = ? ORDER BY season ASC, episode ASC", (code,)) as cursor:
             episodes = await cursor.fetchall()
             if episodes:
@@ -477,7 +595,7 @@ async def send_episode(callback: types.CallbackQuery):
 
 # --- WEB SERVER (UPTIMEROBOT UCHUN) ---
 async def handle_ping(request):
-    return web.Response(text="Bot 24/7 ishlamoqda!")
+    return web.Response(text="Bot 24/7 faol ishlamoqda!")
 
 async def start_web_server():
     app = web.Application()
@@ -488,7 +606,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- ISHGA TUSHIRISH ---
+# --- BOTNI ISHGA TUSHIRISH ---
 async def main():
     await init_db()
     await start_web_server()
