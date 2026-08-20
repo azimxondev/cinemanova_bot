@@ -103,7 +103,7 @@ class DeleteChannelState(StatesGroup):
 # --- KLAVIATURALAR ---
 def get_user_keyboard():
     kb = [
-        [KeyboardButton(text="🎬 Barcha Kinolar"), KeyboardButton(text="📺 Barcha Seriallar")],
+        [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="📺 Seriallar")],
         [KeyboardButton(text="🎲 Tasodifiy kino"), KeyboardButton(text="🔥 TOP Kinolar")],
         [KeyboardButton(text="ℹ️ Bot haqida va qo'llanma")]
     ]
@@ -206,18 +206,81 @@ async def check_sub_callback(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
 
-# --- USER TUGMALARI VA FUNKSIYALARI ---
+# --- USER TUGMALARI VA QO'LLANMA ---
 @dp.message(F.text == "ℹ️ Bot haqida va qo'llanma")
 async def info_handler(message: types.Message):
     text = (
         "📖 **CinemaNova Bot Qo'llanmasi:**\n\n"
-        "1. **Kino qidirish:** Kinoning kodini (masalan: `10`) yuboring, bot darhol videoni chiqarib beradi.\n"
-        "2. **Serial ko'rish:** Serial kodini yuborsangiz, barcha qismlar tugmalar ko'rinishida chiqadi.\n"
+        "1. **Kino qidirish:** Kinoning kodini (masalan: `1`) yuborsangiz, bot videoni chiqarib beradi.\n"
+        "2. **Serial ko'rish:** Serial kodini yuborsangiz, barcha qismlari chiqadi.\n"
         "3. **Baholash:** Kinoni ko'rib bo'lgach, tagidagi ⭐ tugmalar orqali baho berishingiz mumkin.\n"
-        "4. **Ro'yxatlar:** **🎬 Barcha Kinolar** tugmasi orqali mavjud barcha filmlar kodlarini ko'rishingiz mumkin."
+        "4. **Ro'yxatlar:** **🎬 Kinolar** yoki **📺 Seriallar** tugmasi orqali mavjud barcha kontentlar ro'yxatini ko'rishingiz mumkin."
     )
     await message.answer(text, parse_mode="Markdown")
 
+# --- KINOLAR RO'YXATI (ADMIN VA USER UCHUN) ---
+@dp.message(F.text.contains("Kinolar"))
+async def list_movies(message: types.Message):
+    is_sub, unsub_channels = await check_subscription(message.from_user.id)
+    if not is_sub:
+        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT code, name, genre, rating, duration FROM movies ORDER BY code ASC") as cursor:
+            movies = await cursor.fetchall()
+            if not movies:
+                await message.answer("Hozircha bazada kinolar mavjud emas.")
+                return
+            
+            text = "🎬 **Mavjud kinolar ro'yxati:**\n\n"
+            for code, name, genre, rating, duration in movies:
+                text += (
+                    f"🎬 **{name}**\n"
+                    f"🎭 Janr: {genre}\n"
+                    f"⭐ IMDb: {rating}\n"
+                    f"⏳ Davomiyligi: {duration}\n"
+                    f"🔑 Kodi: `{code}`\n"
+                    f"────────────────────\n"
+                )
+            text += "\n*Tomosha qilish uchun kino kodini yozib yuboring!*"
+            await message.answer(text, parse_mode="Markdown")
+
+# --- SERIALLAR RO'YXATI (AVTOMATIK QISMLAR SONI BILAN) ---
+@dp.message(F.text.contains("Seriallar"))
+async def list_series(message: types.Message):
+    is_sub, unsub_channels = await check_subscription(message.from_user.id)
+    if not is_sub:
+        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Har bir serialning nomi, kodi va nechta qism mavjudligini hisoblaydi
+        query = """
+            SELECT code, name, COUNT(id) as total_episodes, MAX(season) as total_seasons 
+            FROM series 
+            GROUP BY code 
+            ORDER BY code ASC
+        """
+        async with db.execute(query) as cursor:
+            series = await cursor.fetchall()
+            if not series:
+                await message.answer("Hozircha bazada seriallar mavjud emas.")
+                return
+            
+            text = "📺 **Mavjud seriallar ro'yxati:**\n\n"
+            for code, name, total_episodes, total_seasons in series:
+                text += (
+                    f"📺 **{name}**\n"
+                    f"📦 Mavsumlar: {total_seasons}-fasl\n"
+                    f"🎞 Qismlar soni: {total_episodes} ta qism\n"
+                    f"🔑 Kodi: `{code}`\n"
+                    f"────────────────────\n"
+                )
+            text += "\n*Qismlarni tanlash uchun serial kodini chatga yuboring!*"
+            await message.answer(text, parse_mode="Markdown")
+
+# --- TASODIFIY KINO VA TOP KINOLAR ---
 @dp.message(F.text == "🎲 Tasodifiy kino")
 async def random_movie_handler(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -238,7 +301,7 @@ async def random_movie_handler(message: types.Message):
                 f"🎲 **Tasodifiy tanlangan kino:**\n\n"
                 f"🎬 **{name}**\n"
                 f"🎭 Janr: {genre}\n"
-                f"⭐ IMDb Reyting: {rating}\n"
+                f"⭐ IMDb: {rating}\n"
                 f"⏳ Davomiyligi: {duration}\n"
                 f"🔑 Kodi: `{code}`\n\n"
                 f"👇 *Kinoni baholang:*"
@@ -270,51 +333,10 @@ async def top_movies_handler(message: types.Message):
                 await message.answer("🔥 Hozircha foydalanuvchilar tomonidan baholangan TOP kinolar mavjud emas.")
                 return
             
-            text = "🔥 **Foydalanuvchilar e'tirofiga ko'ra TOP kinolar:**\n\n"
+            text = "🔥 **Foydalanuvchilar bahosi bo'yicha TOP kinolar:**\n\n"
             for idx, (code, name, avg_rate, votes) in enumerate(top_list, 1):
-                text += f"{idx}. **{name}** — ⭐ {avg_rate:.1f} ({votes} ta ovoz) | Kodi: `{code}`\n"
+                text += f"{idx}. **{name}** — ⭐ {avg_rate:.1f} ({votes} ta baho) | Kodi: `{code}`\n"
             
-            await message.answer(text, parse_mode="Markdown")
-
-# Kinolar ro'yxati
-@dp.message(F.text.in_(["🎬 Kinolar", "🎬 Barcha Kinolar"]))
-async def list_movies(message: types.Message):
-    is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
-        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT code, name, genre, rating, duration FROM movies") as cursor:
-            movies = await cursor.fetchall()
-            if not movies:
-                await message.answer("Hozircha bazada kinolar mavjud emas.")
-                return
-            
-            text = "🎬 **Mavjud kinolar ro'yxati:**\n\n"
-            for code, name, genre, rating, duration in movies:
-                text += f"🍿 **{name}**\n├ Janr: {genre}\n├ IMDb: ⭐ {rating}\n├ Vaqti: ⏳ {duration}\n└ Kodi: 🔑 `{code}`\n\n"
-            await message.answer(text, parse_mode="Markdown")
-
-# Seriallar ro'yxati
-@dp.message(F.text.in_(["📺 Seriallar", "📺 Barcha Seriallar"]))
-async def list_series(message: types.Message):
-    is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
-        await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT DISTINCT code, name FROM series") as cursor:
-            series = await cursor.fetchall()
-            if not series:
-                await message.answer("Hozircha bazada seriallar mavjud emas.")
-                return
-            
-            text = "📺 **Mavjud seriallar ro'yxati:**\n\n"
-            for code, name in series:
-                text += f"🔹 **{name}** — Kodi: 🔑 `{code}`\n"
-            text += "\n*Qismlarni ko'rish uchun serial kodini chatga yuboring.*"
             await message.answer(text, parse_mode="Markdown")
 
 # --- RATING CALLBACK ---
@@ -333,7 +355,7 @@ async def handle_rating(callback: types.CallbackQuery):
         """, (user_id, code, stars))
         await db.commit()
     
-    await callback.answer(f"Rahmat! Ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
+    await callback.answer(f"Rahmat! Siz ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
 
 # --- ADMIN: STATISTIKA VA KANALLAR ---
 @dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
@@ -412,7 +434,7 @@ async def del_channel_finish(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Kanal o'chirildi!", reply_markup=get_admin_keyboard())
 
-# --- ADMIN: KONTENT QO'SHISH (XATOLIKLARNI OLDINI OLUVCHI) ---
+# --- ADMIN: KONTENT QO'SHISH ---
 @dp.message(F.text == "➕ Qo'shish", F.from_user.id == ADMIN_ID)
 async def add_choice(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -425,7 +447,7 @@ async def add_choice(message: types.Message):
 @dp.callback_query(F.data == "add_type_movie")
 async def start_add_movie(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddMovieState.code)
-    await callback.message.answer("Kino uchun kod kiriting (masalan: `10`):", reply_markup=get_cancel_kb())
+    await callback.message.answer("Kino uchun kod kiriting (masalan: `1` yoki `10`):", reply_markup=get_cancel_kb())
 
 @dp.message(AddMovieState.code)
 async def step_m_code_check(message: types.Message, state: FSMContext):
@@ -440,7 +462,7 @@ async def step_m_code_check(message: types.Message, state: FSMContext):
     if existing_movie:
         await message.answer(
             f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_movie[0]}\"** kinosiga berilgan!\n\n"
-            f"Eski kino o'chib ketmasligi uchun boshqa kod kiriting (yoki Bekor qilishni bosing):",
+            f"Eski kino o'chib ketmasligi uchun boshqa kod kiriting:",
             parse_mode="Markdown"
         )
         return
@@ -461,25 +483,25 @@ async def step_m_code_check(message: types.Message, state: FSMContext):
 async def step_m_genre(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AddMovieState.genre)
-    await message.answer("Kino janrini kiriting (masalan: `Fantastika, Jangari`):")
+    await message.answer("Kino janrini kiriting (masalan: `Superhero, Jangari`):")
 
 @dp.message(AddMovieState.genre)
 async def step_m_rating(message: types.Message, state: FSMContext):
     await state.update_data(genre=message.text.strip())
     await state.set_state(AddMovieState.rating)
-    await message.answer("IMDb reytingini kiriting (masalan: `8.6/10`):")
+    await message.answer("IMDb reytingini kiriting (masalan: `9.3`):")
 
 @dp.message(AddMovieState.rating)
 async def step_m_dur(message: types.Message, state: FSMContext):
     await state.update_data(rating=message.text.strip())
     await state.set_state(AddMovieState.duration)
-    await message.answer("Davomiyligini kiriting (masalan: `2 soat 15 min`):")
+    await message.answer("Davomiyligini kiriting (masalan: `2 soat 5 minut`):")
 
 @dp.message(AddMovieState.duration)
 async def step_m_file(message: types.Message, state: FSMContext):
     await state.update_data(duration=message.text.strip())
     await state.set_state(AddMovieState.media)
-    await message.answer("Kino video yoki faylini yuboring:")
+    await message.answer("Kino videosi yoki faylini yuboring:")
 
 @dp.message(AddMovieState.media, F.video | F.document)
 async def finish_add_movie(message: types.Message, state: FSMContext):
@@ -529,7 +551,6 @@ async def step_s_code_check(message: types.Message, state: FSMContext):
     await state.update_data(code=code)
     
     if existing_series:
-        # Serial allaqachon mavjud bo'lsa nomini qayta so'ramaydi
         await state.update_data(name=existing_series[0])
         await state.set_state(AddSeriesState.season)
         await message.answer(f"Ushbu kod **\"{existing_series[0]}\"** serialiga tegishli.\n\nFasl (Season) raqamini kiriting (masalan: `1`):")
@@ -546,7 +567,7 @@ async def step_s_season(message: types.Message, state: FSMContext):
 @dp.message(AddSeriesState.season)
 async def step_s_ep(message: types.Message, state: FSMContext):
     if not message.text.strip().isdigit():
-        await message.answer("⚠️ Iltimos, fasl raqamini faqat butun son ko'rinishida kiriting (masalan: `1`):")
+        await message.answer("⚠️ Iltimos, fasl raqamini faqat son shaklida kiriting (masalan: `1`):")
         return
     
     await state.update_data(season=int(message.text.strip()))
@@ -556,7 +577,7 @@ async def step_s_ep(message: types.Message, state: FSMContext):
 @dp.message(AddSeriesState.episode)
 async def step_s_file(message: types.Message, state: FSMContext):
     if not message.text.strip().isdigit():
-        await message.answer("⚠️ Iltimos, qism raqamini faqat butun son ko'rinishida kiriting (masalan: `1`):")
+        await message.answer("⚠️ Iltimos, qism raqamini faqat son shaklida kiriting (masalan: `1`):")
         return
     
     episode = int(message.text.strip())
@@ -618,12 +639,12 @@ async def delete_content_finish(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ `{code}` kodiga tegishli barcha ma'lumotlar o'chirildi.", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
-# --- FOYDALANUVCHI QIDIRUVI (TEZKOR VA ANIQ) ---
+# --- FOYDALANUVCHI QIDIRUVI (KOD BO'YICHA) ---
 @dp.message(F.text)
 async def search_handler(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
-        await message.answer("⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
+        await message.answer("⚠️ Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
     code = message.text.strip().lower()
@@ -637,7 +658,7 @@ async def search_handler(message: types.Message):
                 
                 async with db.execute("SELECT AVG(stars), COUNT(id) FROM movie_ratings WHERE LOWER(code) = ?", (code,)) as r_cur:
                     r_data = await r_cur.fetchone()
-                    avg_stars = f"{r_data[0]:.1f} ⭐ ({r_data[1]} ta ovoz)" if r_data and r_data[0] else "Hali baholanmagan"
+                    avg_stars = f"{r_data[0]:.1f} ⭐ ({r_data[1]} ta baho)" if r_data and r_data[0] else "Hali baholanmagan"
 
                 caption = (
                     f"🎬 **{name}**\n\n"
@@ -670,7 +691,7 @@ async def search_handler(message: types.Message):
                 await message.answer(f"📺 **{s_name}** seriali qismlari:\n\nTomosha qilish uchun kerakli qismni tanlang 👇", reply_markup=inline_kb, parse_mode="Markdown")
                 return
 
-    await message.answer("❌ Bu kod bo'yicha hech qanday kino yoki serial topilmadi.\n\nKod to'g'riligini tekshiring yoki **🎬 Barcha Kinolar** bo'limiga qarang.")
+    await message.answer("❌ Bu kod bo'yicha hech narsa topilmadi.\n\nMavjud filmlarni ko'rish uchun **🎬 Kinolar** yoki **📺 Seriallar** tugmasini bosing.")
 
 @dp.callback_query(F.data.startswith("ep_"))
 async def send_episode(callback: types.CallbackQuery):
