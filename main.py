@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import random
-import aiosqlite
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
@@ -17,29 +17,37 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 TOKEN = "8899711923:AAFrimd3MF8WWN9R5WalkGeVHrBuBSmfq-M"
 ADMIN_ID = 5361309526
-DB_NAME = "cinemanova.db"
+
+# Render-da ochgan PostgreSQL Database URL manzilingizni shu yerga qo'ying:
+# Masalan: postgresql://cinemanova:parol@dpg-xxxx.render.com/cinemanova
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@host/dbname")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+db_pool = None
 
-# --- DATABASE SOZLAMALARI ---
+# --- DATABASE SOZLAMALARI (POSTGRESQL) ---
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+    global db_pool
+    # Agar Render URL 'postgres://' bilan boshlansa, uni 'postgresql://' ga o'giramiz
+    db_url = DATABASE_URL
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+        
+    db_pool = await asyncpg.create_pool(dsn=db_url)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-        await db.execute("""
+                user_id BIGINT PRIMARY KEY
+            );
             CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 channel_id TEXT UNIQUE,
                 title TEXT,
                 url TEXT
-            )
-        """)
-        await db.execute("""
+            );
             CREATE TABLE IF NOT EXISTS movies (
                 code TEXT PRIMARY KEY,
                 name TEXT,
@@ -48,30 +56,25 @@ async def init_db():
                 duration TEXT,
                 file_id TEXT,
                 file_type TEXT
-            )
-        """)
-        await db.execute("""
+            );
             CREATE TABLE IF NOT EXISTS series (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 code TEXT,
                 name TEXT,
-                season INTEGER,
-                episode INTEGER,
+                season INT,
+                episode INT,
                 file_id TEXT,
                 file_type TEXT,
                 UNIQUE(code, season, episode)
-            )
-        """)
-        await db.execute("""
+            );
             CREATE TABLE IF NOT EXISTS movie_ratings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
                 code TEXT,
-                stars INTEGER,
+                stars INT,
                 UNIQUE(user_id, code)
-            )
+            );
         """)
-        await db.commit()
 
 # --- FSM STATES ---
 class AddMovieState(StatesGroup):
@@ -142,16 +145,15 @@ async def check_subscription(user_id: int) -> tuple[bool, list]:
         return True, []
     
     unsubscribed = []
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_id, title, url FROM channels") as cursor:
-            channels = await cursor.fetchall()
-            for ch_id, title, url in channels:
-                try:
-                    member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
-                    if not isinstance(member, (ChatMemberOwner, ChatMemberAdministrator, ChatMemberMember)):
-                        unsubscribed.append((title, url))
-                except Exception:
-                    unsubscribed.append((title, url))
+    async with db_pool.acquire() as conn:
+        channels = await conn.fetch("SELECT channel_id, title, url FROM channels")
+        for row in channels:
+            try:
+                member = await bot.get_chat_member(chat_id=row['channel_id'], user_id=user_id)
+                if not isinstance(member, (ChatMemberOwner, ChatMemberAdministrator, ChatMemberMember)):
+                    unsubscribed.append((row['title'], row['url']))
+            except Exception:
+                unsubscribed.append((row['title'], row['url']))
     return len(unsubscribed) == 0, unsubscribed
 
 def get_sub_inline_kb(channels: list):
@@ -172,9 +174,8 @@ async def cancel_handler(message: types.Message, state: FSMContext):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", message.from_user.id)
 
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
@@ -214,11 +215,11 @@ async def info_handler(message: types.Message):
         "1. **Kino qidirish:** Kinoning kodini (masalan: `1`) yuborsangiz, bot videoni chiqarib beradi.\n"
         "2. **Serial ko'rish:** Serial kodini yuborsangiz, barcha qismlari chiqadi.\n"
         "3. **Baholash:** Kinoni ko'rib bo'lgach, tagidagi ⭐ tugmalar orqali baho berishingiz mumkin.\n"
-        "4. **Ro'yxatlar:** **🎬 Kinolar** yoki **📺 Seriallar** tugmasi orqali mavjud barcha kontentlar ro'yxatini ko'rishingiz mumkin."
+        "4. **Ro'yxatlar:** **🎬 Kinolar** yoki **📺 Seriallar** tugmasi orqali barcha bazadagi kontentlarni ko'rishingiz mumkin."
     )
     await message.answer(text, parse_mode="Markdown")
 
-# --- KINOLAR RO'YXATI (ADMIN VA USER UCHUN) ---
+# --- KINOLAR RO'YXATI ---
 @dp.message(F.text.contains("Kinolar"))
 async def list_movies(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -226,27 +227,26 @@ async def list_movies(message: types.Message):
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT code, name, genre, rating, duration FROM movies ORDER BY code ASC") as cursor:
-            movies = await cursor.fetchall()
-            if not movies:
-                await message.answer("Hozircha bazada kinolar mavjud emas.")
-                return
-            
-            text = "🎬 **Mavjud kinolar ro'yxati:**\n\n"
-            for code, name, genre, rating, duration in movies:
-                text += (
-                    f"🎬 **{name}**\n"
-                    f"🎭 Janr: {genre}\n"
-                    f"⭐ IMDb: {rating}\n"
-                    f"⏳ Davomiyligi: {duration}\n"
-                    f"🔑 Kodi: `{code}`\n"
-                    f"────────────────────\n"
-                )
-            text += "\n*Tomosha qilish uchun kino kodini yozib yuboring!*"
-            await message.answer(text, parse_mode="Markdown")
+    async with db_pool.acquire() as conn:
+        movies = await conn.fetch("SELECT code, name, genre, rating, duration FROM movies ORDER BY code ASC")
+        if not movies:
+            await message.answer("Hozircha bazada kinolar mavjud emas.")
+            return
+        
+        text = "🎬 **Mavjud kinolar ro'yxati:**\n\n"
+        for row in movies:
+            text += (
+                f"🎬 **{row['name']}**\n"
+                f"🎭 Janr: {row['genre']}\n"
+                f"⭐ IMDb: {row['rating']}\n"
+                f"⏳ Davomiyligi: {row['duration']}\n"
+                f"🔑 Kodi: `{row['code']}`\n"
+                f"────────────────────\n"
+            )
+        text += "\n*Tomosha qilish uchun kino kodini yozib yuboring!*"
+        await message.answer(text, parse_mode="Markdown")
 
-# --- SERIALLAR RO'YXATI (AVTOMATIK QISMLAR SONI BILAN) ---
+# --- SERIALLAR RO'YXATI ---
 @dp.message(F.text.contains("Seriallar"))
 async def list_series(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -254,31 +254,29 @@ async def list_series(message: types.Message):
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Har bir serialning nomi, kodi va nechta qism mavjudligini hisoblaydi
+    async with db_pool.acquire() as conn:
         query = """
             SELECT code, name, COUNT(id) as total_episodes, MAX(season) as total_seasons 
             FROM series 
-            GROUP BY code 
+            GROUP BY code, name 
             ORDER BY code ASC
         """
-        async with db.execute(query) as cursor:
-            series = await cursor.fetchall()
-            if not series:
-                await message.answer("Hozircha bazada seriallar mavjud emas.")
-                return
-            
-            text = "📺 **Mavjud seriallar ro'yxati:**\n\n"
-            for code, name, total_episodes, total_seasons in series:
-                text += (
-                    f"📺 **{name}**\n"
-                    f"📦 Mavsumlar: {total_seasons}-fasl\n"
-                    f"🎞 Qismlar soni: {total_episodes} ta qism\n"
-                    f"🔑 Kodi: `{code}`\n"
-                    f"────────────────────\n"
-                )
-            text += "\n*Qismlarni tanlash uchun serial kodini chatga yuboring!*"
-            await message.answer(text, parse_mode="Markdown")
+        series = await conn.fetch(query)
+        if not series:
+            await message.answer("Hozircha bazada seriallar mavjud emas.")
+            return
+        
+        text = "📺 **Mavjud seriallar ro'yxati:**\n\n"
+        for row in series:
+            text += (
+                f"📺 **{row['name']}**\n"
+                f"📦 Mavsumlar: {row['total_seasons']}-fasl\n"
+                f"🎞 Qismlar soni: {row['total_episodes']} ta qism\n"
+                f"🔑 Kodi: `{row['code']}`\n"
+                f"────────────────────\n"
+            )
+        text += "\n*Qismlarni tanlash uchun serial kodini chatga yuboring!*"
+        await message.answer(text, parse_mode="Markdown")
 
 # --- TASODIFIY KINO VA TOP KINOLAR ---
 @dp.message(F.text == "🎲 Tasodifiy kino")
@@ -288,28 +286,26 @@ async def random_movie_handler(message: types.Message):
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT code, name, genre, rating, duration, file_id, file_type FROM movies") as cursor:
-            movies = await cursor.fetchall()
-            if not movies:
-                await message.answer("Bazada kinolar mavjud emas.")
-                return
-            
-            movie = random.choice(movies)
-            code, name, genre, rating, duration, file_id, file_type = movie
-            caption = (
-                f"🎲 **Tasodifiy tanlangan kino:**\n\n"
-                f"🎬 **{name}**\n"
-                f"🎭 Janr: {genre}\n"
-                f"⭐ IMDb: {rating}\n"
-                f"⏳ Davomiyligi: {duration}\n"
-                f"🔑 Kodi: `{code}`\n\n"
-                f"👇 *Kinoni baholang:*"
-            )
-            if file_type == "video":
-                await message.answer_video(video=file_id, caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
-            else:
-                await message.answer_document(document=file_id, caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
+    async with db_pool.acquire() as conn:
+        movies = await conn.fetch("SELECT code, name, genre, rating, duration, file_id, file_type FROM movies")
+        if not movies:
+            await message.answer("Bazada kinolar mavjud emas.")
+            return
+        
+        movie = random.choice(movies)
+        caption = (
+            f"🎲 **Tasodifiy tanlangan kino:**\n\n"
+            f"🎬 **{movie['name']}**\n"
+            f"🎭 Janr: {movie['genre']}\n"
+            f"⭐ IMDb: {movie['rating']}\n"
+            f"⏳ Davomiyligi: {movie['duration']}\n"
+            f"🔑 Kodi: `{movie['code']}`\n\n"
+            f"👇 *Kinoni baholang:*"
+        )
+        if movie['file_type'] == "video":
+            await message.answer_video(video=movie['file_id'], caption=caption, reply_markup=get_rating_inline_kb(movie['code']), parse_mode="Markdown")
+        else:
+            await message.answer_document(document=movie['file_id'], caption=caption, reply_markup=get_rating_inline_kb(movie['code']), parse_mode="Markdown")
 
 @dp.message(F.text == "🔥 TOP Kinolar")
 async def top_movies_handler(message: types.Message):
@@ -318,26 +314,25 @@ async def top_movies_handler(message: types.Message):
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_pool.acquire() as conn:
         query = """
             SELECT m.code, m.name, AVG(r.stars) as avg_rating, COUNT(r.id) as votes
             FROM movies m
             JOIN movie_ratings r ON m.code = r.code
-            GROUP BY m.code
+            GROUP BY m.code, m.name
             ORDER BY avg_rating DESC, votes DESC
             LIMIT 10
         """
-        async with db.execute(query) as cursor:
-            top_list = await cursor.fetchall()
-            if not top_list:
-                await message.answer("🔥 Hozircha foydalanuvchilar tomonidan baholangan TOP kinolar mavjud emas.")
-                return
-            
-            text = "🔥 **Foydalanuvchilar bahosi bo'yicha TOP kinolar:**\n\n"
-            for idx, (code, name, avg_rate, votes) in enumerate(top_list, 1):
-                text += f"{idx}. **{name}** — ⭐ {avg_rate:.1f} ({votes} ta baho) | Kodi: `{code}`\n"
-            
-            await message.answer(text, parse_mode="Markdown")
+        top_list = await conn.fetch(query)
+        if not top_list:
+            await message.answer("🔥 Hozircha baholangan TOP kinolar mavjud emas.")
+            return
+        
+        text = "🔥 **Foydalanuvchilar bahosi bo'yicha TOP kinolar:**\n\n"
+        for idx, row in enumerate(top_list, 1):
+            text += f"{idx}. **{row['name']}** — ⭐ {float(row['avg_rating']):.1f} ({row['votes']} ta baho) | Kodi: `{row['code']}`\n"
+        
+        await message.answer(text, parse_mode="Markdown")
 
 # --- RATING CALLBACK ---
 @dp.callback_query(F.data.startswith("rate_"))
@@ -347,26 +342,22 @@ async def handle_rating(callback: types.CallbackQuery):
     stars = int(parts[2])
     user_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
             INSERT INTO movie_ratings (user_id, code, stars)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, code) DO UPDATE SET stars=excluded.stars
-        """, (user_id, code, stars))
-        await db.commit()
+            VALUES ($1, $2, $3)
+            ON CONFLICT(user_id, code) DO UPDATE SET stars = EXCLUDED.stars
+        """, user_id, code, stars)
     
-    await callback.answer(f"Rahmat! Siz ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
+    await callback.answer(f"Rahmat! Ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
 
 # --- ADMIN: STATISTIKA VA KANALLAR ---
 @dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
 async def stats_handler(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c1:
-            users_count = (await c1.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM movies") as c2:
-            movies_count = (await c2.fetchone())[0]
-        async with db.execute("SELECT COUNT(DISTINCT code) FROM series") as c3:
-            series_count = (await c3.fetchone())[0]
+    async with db_pool.acquire() as conn:
+        users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        movies_count = await conn.fetchval("SELECT COUNT(*) FROM movies")
+        series_count = await conn.fetchval("SELECT COUNT(DISTINCT code) FROM series")
             
     await message.answer(
         f"📊 **Bot statistikasi:**\n\n"
@@ -377,16 +368,15 @@ async def stats_handler(message: types.Message):
 
 @dp.message(F.text == "📝 Kanallar ro'yxati", F.from_user.id == ADMIN_ID)
 async def list_channels(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_id, title, url FROM channels") as cursor:
-            channels = await cursor.fetchall()
-            if not channels:
-                await message.answer("Majburiy obuna kanallari yo'q.")
-                return
-            text = "📢 **Ulangan kanallar:**\n\n"
-            for ch_id, title, url in channels:
-                text += f"🔹 {title} (ID: `{ch_id}`)\n🔗 {url}\n\n"
-            await message.answer(text)
+    async with db_pool.acquire() as conn:
+        channels = await conn.fetch("SELECT channel_id, title, url FROM channels")
+        if not channels:
+            await message.answer("Majburiy obuna kanallari yo'q.")
+            return
+        text = "📢 **Ulangan kanallar:**\n\n"
+        for row in channels:
+            text += f"🔹 {row['title']} (ID: `{row['channel_id']}`)\n🔗 {row['url']}\n\n"
+        await message.answer(text)
 
 @dp.message(F.text == "📢 Kanal qo'shish", F.from_user.id == ADMIN_ID)
 async def add_channel_start(message: types.Message, state: FSMContext):
@@ -410,12 +400,11 @@ async def add_channel_url(message: types.Message, state: FSMContext):
     data = await state.get_data()
     url = message.text.strip()
     try:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(
-                "INSERT INTO channels (channel_id, title, url) VALUES (?, ?, ?)",
-                (data['channel_id'], data['title'], url)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO channels (channel_id, title, url) VALUES ($1, $2, $3)",
+                data['channel_id'], data['title'], url
             )
-            await db.commit()
         await message.answer("✅ Kanal muvaffaqiyatli qo'shildi!", reply_markup=get_admin_keyboard())
     except Exception as e:
         await message.answer(f"Xatolik: {e}", reply_markup=get_admin_keyboard())
@@ -428,9 +417,8 @@ async def del_channel_start(message: types.Message, state: FSMContext):
 
 @dp.message(DeleteChannelState.channel_id)
 async def del_channel_finish(message: types.Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM channels WHERE channel_id = ?", (message.text.strip(),))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM channels WHERE channel_id = $1", message.text.strip())
     await state.clear()
     await message.answer("✅ Kanal o'chirildi!", reply_markup=get_admin_keyboard())
 
@@ -453,15 +441,13 @@ async def start_add_movie(callback: types.CallbackQuery, state: FSMContext):
 async def step_m_code_check(message: types.Message, state: FSMContext):
     code = message.text.strip().lower()
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM movies WHERE LOWER(code) = ?", (code,)) as cur1:
-            existing_movie = await cur1.fetchone()
-        async with db.execute("SELECT name FROM series WHERE LOWER(code) = ?", (code,)) as cur2:
-            existing_series = await cur2.fetchone()
+    async with db_pool.acquire() as conn:
+        existing_movie = await conn.fetchrow("SELECT name FROM movies WHERE LOWER(code) = $1", code)
+        existing_series = await conn.fetchrow("SELECT name FROM series WHERE LOWER(code) = $1", code)
 
     if existing_movie:
         await message.answer(
-            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_movie[0]}\"** kinosiga berilgan!\n\n"
+            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_movie['name']}\"** kinosiga berilgan!\n\n"
             f"Eski kino o'chib ketmasligi uchun boshqa kod kiriting:",
             parse_mode="Markdown"
         )
@@ -469,7 +455,7 @@ async def step_m_code_check(message: types.Message, state: FSMContext):
     
     if existing_series:
         await message.answer(
-            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_series[0]}\"** serialiga berilgan!\n\n"
+            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_series['name']}\"** serialiga berilgan!\n\n"
             f"Iltimos, boshqa kod kiriting:",
             parse_mode="Markdown"
         )
@@ -514,15 +500,14 @@ async def finish_add_movie(message: types.Message, state: FSMContext):
         file_id = message.document.file_id
         file_type = "document"
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO movies (code, name, genre, rating, duration, file_id, file_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (data['code'], data['name'], data['genre'], data['rating'], data['duration'], file_id, file_type)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO movies (code, name, genre, rating, duration, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            data['code'], data['name'], data['genre'], data['rating'], data['duration'], file_id, file_type
         )
-        await db.commit()
     
     await state.clear()
-    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan bazaga doimiy saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
 # 2. SERIAL QISMINI QO'SHISH
 @dp.callback_query(F.data == "add_type_series")
@@ -534,15 +519,13 @@ async def start_add_series(callback: types.CallbackQuery, state: FSMContext):
 async def step_s_code_check(message: types.Message, state: FSMContext):
     code = message.text.strip().lower()
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name FROM movies WHERE LOWER(code) = ?", (code,)) as cur:
-            existing_movie = await cur.fetchone()
-        async with db.execute("SELECT name FROM series WHERE LOWER(code) = ? LIMIT 1", (code,)) as cur2:
-            existing_series = await cur2.fetchone()
+    async with db_pool.acquire() as conn:
+        existing_movie = await conn.fetchrow("SELECT name FROM movies WHERE LOWER(code) = $1", code)
+        existing_series = await conn.fetchrow("SELECT name FROM series WHERE LOWER(code) = $1 LIMIT 1", code)
 
     if existing_movie:
         await message.answer(
-            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_movie[0]}\"** kinosiga berilgan!\n\n"
+            f"⚠️ **Diqqat!** Ushbu `{code}` kodi allaqachon **\"{existing_movie['name']}\"** kinosiga berilgan!\n\n"
             f"Iltimos, serial uchun boshqa kod kiriting:",
             parse_mode="Markdown"
         )
@@ -551,9 +534,9 @@ async def step_s_code_check(message: types.Message, state: FSMContext):
     await state.update_data(code=code)
     
     if existing_series:
-        await state.update_data(name=existing_series[0])
+        await state.update_data(name=existing_series['name'])
         await state.set_state(AddSeriesState.season)
-        await message.answer(f"Ushbu kod **\"{existing_series[0]}\"** serialiga tegishli.\n\nFasl (Season) raqamini kiriting (masalan: `1`):")
+        await message.answer(f"Ushbu kod **\"{existing_series['name']}\"** serialiga tegishli.\n\nFasl (Season) raqamini kiriting (masalan: `1`):")
     else:
         await state.set_state(AddSeriesState.name)
         await message.answer("Yangi serial nomini kiriting:")
@@ -583,12 +566,11 @@ async def step_s_file(message: types.Message, state: FSMContext):
     episode = int(message.text.strip())
     data = await state.get_data()
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT id FROM series WHERE LOWER(code) = ? AND season = ? AND episode = ?",
-            (data['code'], data['season'], episode)
-        ) as cur:
-            exists = await cur.fetchone()
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchrow(
+            "SELECT id FROM series WHERE LOWER(code) = $1 AND season = $2 AND episode = $3",
+            data['code'], data['season'], episode
+        )
     
     if exists:
         await message.answer(
@@ -613,12 +595,11 @@ async def finish_add_series(message: types.Message, state: FSMContext):
         file_id = message.document.file_id
         file_type = "document"
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO series (code, name, season, episode, file_id, file_type) VALUES (?, ?, ?, ?, ?, ?)",
-            (data['code'], data['name'], data['season'], data['episode'], file_id, file_type)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO series (code, name, season, episode, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6)",
+            data['code'], data['name'], data['season'], data['episode'], file_id, file_type
         )
-        await db.commit()
     
     await state.clear()
     await message.answer(f"✅ **\"{data['name']}\"** ({data['season']}-fasl, {data['episode']}-qism) saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
@@ -632,14 +613,13 @@ async def delete_content_start(message: types.Message, state: FSMContext):
 @dp.message(DeleteContentState.code)
 async def delete_content_finish(message: types.Message, state: FSMContext):
     code = message.text.strip().lower()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM movies WHERE LOWER(code) = ?", (code,))
-        await db.execute("DELETE FROM series WHERE LOWER(code) = ?", (code,))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM movies WHERE LOWER(code) = $1", code)
+        await conn.execute("DELETE FROM series WHERE LOWER(code) = $1", code)
     await state.clear()
     await message.answer(f"✅ `{code}` kodiga tegishli barcha ma'lumotlar o'chirildi.", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
-# --- FOYDALANUVCHI QIDIRUVI (KOD BO'YICHA) ---
+# --- QIDIRUV (KOD BO'YICHA) ---
 @dp.message(F.text)
 async def search_handler(message: types.Message):
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
@@ -649,67 +629,59 @@ async def search_handler(message: types.Message):
 
     code = message.text.strip().lower()
     
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_pool.acquire() as conn:
         # 1. KINOLARDAN IZLASH
-        async with db.execute("SELECT name, genre, rating, duration, file_id, file_type FROM movies WHERE LOWER(code) = ?", (code,)) as cursor:
-            movie = await cursor.fetchone()
-            if movie:
-                name, genre, rating, duration, file_id, file_type = movie
-                
-                async with db.execute("SELECT AVG(stars), COUNT(id) FROM movie_ratings WHERE LOWER(code) = ?", (code,)) as r_cur:
-                    r_data = await r_cur.fetchone()
-                    avg_stars = f"{r_data[0]:.1f} ⭐ ({r_data[1]} ta baho)" if r_data and r_data[0] else "Hali baholanmagan"
+        movie = await conn.fetchrow("SELECT name, genre, rating, duration, file_id, file_type FROM movies WHERE LOWER(code) = $1", code)
+        if movie:
+            r_data = await conn.fetchrow("SELECT AVG(stars) as avg_s, COUNT(id) as cnt FROM movie_ratings WHERE LOWER(code) = $1", code)
+            avg_stars = f"{float(r_data['avg_s']):.1f} ⭐ ({r_data['cnt']} ta baho)" if r_data and r_data['avg_s'] else "Hali baholanmagan"
 
-                caption = (
-                    f"🎬 **{name}**\n\n"
-                    f"🎭 Janr: {genre}\n"
-                    f"⭐ IMDb: {rating}\n"
-                    f"👥 Foydalanuvchilar bahosi: {avg_stars}\n"
-                    f"⏳ Davomiyligi: {duration}\n"
-                    f"🔑 Kodi: `{code}`\n\n"
-                    f"👇 *Kinoga baho bering:*"
-                )
-                
-                if file_type == "video":
-                    await message.answer_video(video=file_id, caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
-                else:
-                    await message.answer_document(document=file_id, caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
-                return
+            caption = (
+                f"🎬 **{movie['name']}**\n\n"
+                f"🎭 Janr: {movie['genre']}\n"
+                f"⭐ IMDb: {movie['rating']}\n"
+                f"👥 Foydalanuvchilar bahosi: {avg_stars}\n"
+                f"⏳ Davomiyligi: {movie['duration']}\n"
+                f"🔑 Kodi: `{code}`\n\n"
+                f"👇 *Kinoga baho bering:*"
+            )
+            
+            if movie['file_type'] == "video":
+                await message.answer_video(video=movie['file_id'], caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
+            else:
+                await message.answer_document(document=movie['file_id'], caption=caption, reply_markup=get_rating_inline_kb(code), parse_mode="Markdown")
+            return
 
         # 2. SERIALLARDAN IZLASH
-        async with db.execute("SELECT id, name, season, episode FROM series WHERE LOWER(code) = ? ORDER BY season ASC, episode ASC", (code,)) as cursor:
-            episodes = await cursor.fetchall()
-            if episodes:
-                s_name = episodes[0][1]
-                buttons = []
-                for ep_id, _, season, ep_num in episodes:
-                    buttons.append(InlineKeyboardButton(text=f"S{season} E{ep_num}", callback_data=f"ep_{ep_id}"))
-                
-                chunked = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-                inline_kb = InlineKeyboardMarkup(inline_keyboard=chunked)
-                
-                await message.answer(f"📺 **{s_name}** seriali qismlari:\n\nTomosha qilish uchun kerakli qismni tanlang 👇", reply_markup=inline_kb, parse_mode="Markdown")
-                return
+        episodes = await conn.fetch("SELECT id, name, season, episode FROM series WHERE LOWER(code) = $1 ORDER BY season ASC, episode ASC", code)
+        if episodes:
+            s_name = episodes[0]['name']
+            buttons = []
+            for row in episodes:
+                buttons.append(InlineKeyboardButton(text=f"S{row['season']} E{row['episode']}", callback_data=f"ep_{row['id']}"))
+            
+            chunked = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=chunked)
+            
+            await message.answer(f"📺 **{s_name}** seriali qismlari:\n\nTomosha qilish uchun kerakli qismni tanlang 👇", reply_markup=inline_kb, parse_mode="Markdown")
+            return
 
     await message.answer("❌ Bu kod bo'yicha hech narsa topilmadi.\n\nMavjud filmlarni ko'rish uchun **🎬 Kinolar** yoki **📺 Seriallar** tugmasini bosing.")
 
 @dp.callback_query(F.data.startswith("ep_"))
 async def send_episode(callback: types.CallbackQuery):
-    ep_id = callback.data.split("_")[1]
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT name, season, episode, file_id, file_type FROM series WHERE id = ?", (ep_id,)) as cursor:
-            ep = await cursor.fetchone()
-            if ep:
-                name, season, episode, file_id, file_type = ep
-                caption = f"📺 **{name}**\n🔹 {season}-fasl, {episode}-qism"
-                
-                if file_type == "video":
-                    await callback.message.answer_video(video=file_id, caption=caption, parse_mode="Markdown")
-                else:
-                    await callback.message.answer_document(document=file_id, caption=caption, parse_mode="Markdown")
-                await callback.answer()
+    ep_id = int(callback.data.split("_")[1])
+    async with db_pool.acquire() as conn:
+        ep = await conn.fetchrow("SELECT name, season, episode, file_id, file_type FROM series WHERE id = $1", ep_id)
+        if ep:
+            caption = f"📺 **{ep['name']}**\n🔹 {ep['season']}-fasl, {ep['episode']}-qism"
+            if ep['file_type'] == "video":
+                await callback.message.answer_video(video=ep['file_id'], caption=caption, parse_mode="Markdown")
             else:
-                await callback.answer("Qism topilmadi!", show_alert=True)
+                await callback.message.answer_document(document=ep['file_id'], caption=caption, parse_mode="Markdown")
+            await callback.answer()
+        else:
+            await callback.answer("Qism topilmadi!", show_alert=True)
 
 # --- WEB SERVER (UPTIMEROBOT UCHUN) ---
 async def handle_ping(request):
@@ -724,7 +696,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- BOTNI ISHGA TUSHIRISH ---
+# --- ISHGA TUSHIRISH ---
 async def main():
     await init_db()
     await start_web_server()
