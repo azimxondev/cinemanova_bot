@@ -25,7 +25,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
 
-# --- DATABASE SOZLAMALARI (POSTGRESQL) ---
+# --- DATABASE SOZLAMALARI ---
 async def init_db():
     global db_pool
     db_url = DATABASE_URL
@@ -152,21 +152,29 @@ def get_rating_inline_kb(code: str):
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# --- MAJBURIY OBUNA TEKSHIRUVI ---
+# --- MAJBURIY OBUNA TEKSHIRUVI (XAVFSIZ QILINGAN) ---
 async def check_subscription(user_id: int) -> tuple[bool, list]:
     if user_id == ADMIN_ID:
         return True, []
     
     unsubscribed = []
-    async with db_pool.acquire() as conn:
-        channels = await conn.fetch("SELECT channel_id, title, url FROM channels")
-        for row in channels:
-            try:
-                member = await bot.get_chat_member(chat_id=row['channel_id'], user_id=user_id)
-                if not isinstance(member, (ChatMemberOwner, ChatMemberAdministrator, ChatMemberMember)):
-                    unsubscribed.append((row['title'], row['url']))
-            except Exception:
-                unsubscribed.append((row['title'], row['url']))
+    try:
+        async with db_pool.acquire() as conn:
+            channels = await conn.fetch("SELECT channel_id, title, url FROM channels")
+            for row in channels:
+                try:
+                    ch_id = int(row['channel_id']) if row['channel_id'].startswith("-") else row['channel_id']
+                    member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
+                    if not isinstance(member, (ChatMemberOwner, ChatMemberAdministrator, ChatMemberMember)):
+                        unsubscribed.append((row['title'], row['url']))
+                except Exception as e:
+                    logging.warning(f"Kanal a'zoligini tekshirishda xatolik: {e}")
+                    # Kanal topilmasa yoki bot admin bo'lmasa userni to'xtatib qo'ymaslik
+                    continue
+    except Exception as e:
+        logging.error(f"Baza tekshiruvida xatolik: {e}")
+        return True, []
+        
     return len(unsubscribed) == 0, unsubscribed
 
 def get_sub_inline_kb(channels: list):
@@ -178,15 +186,18 @@ def get_sub_inline_kb(channels: list):
 
 # --- FOYDALANUVCHINI BAZAGA YOZISH ---
 async def track_user(user: types.User):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, username, full_name, last_active)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-            ON CONFLICT (user_id) DO UPDATE 
-            SET username = EXCLUDED.username,
-                full_name = EXCLUDED.full_name,
-                last_active = CURRENT_TIMESTAMP
-        """, user.id, user.username, user.full_name)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, username, full_name, last_active)
+                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET username = EXCLUDED.username,
+                    full_name = EXCLUDED.full_name,
+                    last_active = CURRENT_TIMESTAMP
+            """, user.id, user.username or "", user.full_name or "")
+    except Exception as e:
+        logging.error(f"User track xatolik: {e}")
 
 # --- START VA ASOSIY MENYU ---
 @dp.message(F.text == "❌ Bekor qilish")
@@ -202,7 +213,7 @@ async def start_handler(message: types.Message):
     await track_user(message.from_user)
 
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer(
             "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
             reply_markup=get_sub_inline_kb(unsub_channels)
@@ -223,8 +234,11 @@ async def start_handler(message: types.Message):
 async def check_sub_callback(callback: types.CallbackQuery):
     await track_user(callback.from_user)
     is_sub, unsub_channels = await check_subscription(callback.from_user.id)
-    if is_sub:
-        await callback.message.delete()
+    if is_sub or not unsub_channels:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         if callback.from_user.id == ADMIN_ID:
             await callback.message.answer("✅ Obuna tasdiqlandi!", reply_markup=get_admin_keyboard())
         else:
@@ -250,7 +264,7 @@ async def suggest_finish(message: types.Message, state: FSMContext):
         await conn.execute("""
             INSERT INTO suggestions (user_id, username, full_name, message)
             VALUES ($1, $2, $3, $4)
-        """, u.id, u.username, u.full_name, text)
+        """, u.id, u.username or "", u.full_name or "", text)
 
     admin_msg = (
         f"💡 **Yangi taklif / buyurtma!**\n\n"
@@ -333,7 +347,7 @@ async def info_handler(message: types.Message):
 async def list_movies(message: types.Message):
     await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
@@ -361,7 +375,7 @@ async def list_movies(message: types.Message):
 async def list_series(message: types.Message):
     await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
@@ -394,7 +408,7 @@ async def list_series(message: types.Message):
 async def random_movie_handler(message: types.Message):
     await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
@@ -423,7 +437,7 @@ async def random_movie_handler(message: types.Message):
 async def top_movies_handler(message: types.Message):
     await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
@@ -727,7 +741,7 @@ async def delete_content_finish(message: types.Message, state: FSMContext):
 async def search_handler(message: types.Message):
     await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
-    if not is_sub:
+    if not is_sub and unsub_channels:
         await message.answer("⚠️ Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
         return
 
@@ -788,7 +802,7 @@ async def send_episode(callback: types.CallbackQuery):
         else:
             await callback.answer("Qism topilmadi!", show_alert=True)
 
-# --- WEB SERVER (UPTIMEROBOT UCHUN TO'G'RI JAVOB) ---
+# --- WEB SERVER ---
 async def handle_ping(request):
     return web.Response(text="Bot 24/7 faol ishlamoqda!", status=200)
 
