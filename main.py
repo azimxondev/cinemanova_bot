@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import random
-from datetime import datetime, timezone
+from datetime import datetime
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -25,14 +25,14 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
 
-# --- DATABASE SOZLAMALARI ---
+# --- DATABASE SOZLAMALARI (POSTGRESQL) ---
 async def init_db():
     global db_pool
     db_url = DATABASE_URL
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
         
-    db_pool = await asyncpg.create_pool(dsn=db_url)
+    db_pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=10)
     
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -176,7 +176,7 @@ def get_sub_inline_kb(channels: list):
     inline_kb.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=inline_kb)
 
-# --- FOYDALANUVCHINI BAZAGA YOZISH / YANGILASH ---
+# --- FOYDALANUVCHINI BAZAGA YOZISH ---
 async def track_user(user: types.User):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -232,12 +232,12 @@ async def check_sub_callback(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
 
-# --- USER: TAKLIF VA BUYURTMA YUBORISH ---
+# --- USER: TAKLIF VA BUYURTMA ---
 @dp.message(F.text == "💡 Kino / Taklif yuborish")
 async def suggest_start(message: types.Message, state: FSMContext):
     await state.set_state(SuggestionState.text)
     await message.answer(
-        "✍️ Botga qaysi kino yoki serial qo'shilishini xohlaysiz? Yoki o'z taklifingizni yozib qoldiring:",
+        "✍️ Qaysi kino yoki serial qo'shilishini xohlaysiz? Yozib qoldiring:",
         reply_markup=get_cancel_kb()
     )
 
@@ -252,12 +252,11 @@ async def suggest_finish(message: types.Message, state: FSMContext):
             VALUES ($1, $2, $3, $4)
         """, u.id, u.username, u.full_name, text)
 
-    # Adminga to'g'ridan-to'g'ri bildirishnoma yuborish
     admin_msg = (
-        f"💡 **Yangi taklif / buyurtma keldi!**\n\n"
+        f"💡 **Yangi taklif / buyurtma!**\n\n"
         f"👤 Kimdan: {u.full_name} (@{u.username if u.username else 'yoq'})\n"
         f"🆔 ID: `{u.id}`\n\n"
-        f"📝 **Taklif matni:**\n{text}"
+        f"📝 **Matn:**\n{text}"
     )
     try:
         await bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="Markdown")
@@ -265,9 +264,9 @@ async def suggest_finish(message: types.Message, state: FSMContext):
         pass
 
     await state.clear()
-    await message.answer("✅ Taklifingiz adminga yetkazildi. Rahmat!", reply_markup=get_user_keyboard())
+    await message.answer("✅ Taklifingiz yetkazildi. Rahmat!", reply_markup=get_user_keyboard())
 
-# --- ADMIN: KELGAN TAKLIFLARNI KO'RISH ---
+# --- ADMIN: KELGAN TAKLIFLAR ---
 @dp.message(F.text == "💡 Kelgan takliflar", F.from_user.id == ADMIN_ID)
 async def view_suggestions(message: types.Message):
     async with db_pool.acquire() as conn:
@@ -276,15 +275,15 @@ async def view_suggestions(message: types.Message):
             await message.answer("Hozircha hech qanday taklif kelmagan.")
             return
 
-        text = "💡 **Oxirgi kelgan 10 ta taklif va buyurtmalar:**\n\n"
+        text = "💡 **Oxirgi 10 ta taklif va buyurtmalar:**\n\n"
         for s in suggestions:
-            u_tag = f"@{s['username']}" if s['username'] else "username yo'q"
+            u_tag = f"@{s['username']}" if s['username'] else "yo'q"
             t_str = s['created_at'].strftime("%d.%m %H:%M")
             text += f"👤 **{s['full_name']}** ({u_tag}) | 🕒 {t_str}\n💬 *{s['message']}*\n────────────────────\n"
 
         await message.answer(text, parse_mode="Markdown")
 
-# --- ADMIN: KENGAYTIRILGAN STATISTIKA (KUNLIK, HAFTALIK, OYLIK) ---
+# --- ADMIN: STATISTIKA ---
 @dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
 async def stats_handler(message: types.Message):
     async with db_pool.acquire() as conn:
@@ -602,13 +601,14 @@ async def finish_add_movie(message: types.Message, state: FSMContext):
         file_type = "document"
 
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO movies (code, name, genre, rating, duration, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            data['code'], data['name'], data['genre'], data['rating'], data['duration'], file_id, file_type
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO movies (code, name, genre, rating, duration, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                data['code'], data['name'], data['genre'], data['rating'], data['duration'], file_id, file_type
+            )
     
     await state.clear()
-    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan doimiy saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
 # 2. SERIAL QISMINI QO'SHISH
 @dp.callback_query(F.data == "add_type_series")
@@ -697,10 +697,11 @@ async def finish_add_series(message: types.Message, state: FSMContext):
         file_type = "document"
 
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO series (code, name, season, episode, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6)",
-            data['code'], data['name'], data['season'], data['episode'], file_id, file_type
-        )
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO series (code, name, season, episode, file_id, file_type) VALUES ($1, $2, $3, $4, $5, $6)",
+                data['code'], data['name'], data['season'], data['episode'], file_id, file_type
+            )
     
     await state.clear()
     await message.answer(f"✅ **\"{data['name']}\"** ({data['season']}-fasl, {data['episode']}-qism) saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
@@ -715,8 +716,9 @@ async def delete_content_start(message: types.Message, state: FSMContext):
 async def delete_content_finish(message: types.Message, state: FSMContext):
     code = message.text.strip().lower()
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM movies WHERE LOWER(code) = $1", code)
-        await conn.execute("DELETE FROM series WHERE LOWER(code) = $1", code)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM movies WHERE LOWER(code) = $1", code)
+            await conn.execute("DELETE FROM series WHERE LOWER(code) = $1", code)
     await state.clear()
     await message.answer(f"✅ `{code}` kodiga tegishli barcha ma'lumotlar o'chirildi.", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
@@ -786,13 +788,14 @@ async def send_episode(callback: types.CallbackQuery):
         else:
             await callback.answer("Qism topilmadi!", show_alert=True)
 
-# --- WEB SERVER (UPTIMEROBOT UCHUN) ---
+# --- WEB SERVER (UPTIMEROBOT UCHUN TO'G'RI JAVOB) ---
 async def handle_ping(request):
-    return web.Response(text="Bot 24/7 faol ishlamoqda!")
+    return web.Response(text="Bot 24/7 faol ishlamoqda!", status=200)
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    app.router.add_head("/", handle_ping)
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
