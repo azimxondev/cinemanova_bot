@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import random
+from datetime import datetime, timezone
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -17,9 +18,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 TOKEN = "8899711923:AAFrimd3MF8WWN9R5WalkGeVHrBuBSmfq-M"
 ADMIN_ID = 5361309526
-
-# Render-da ochgan PostgreSQL Database URL manzilingizni shu yerga qo'ying:
-# Masalan: postgresql://cinemanova:parol@dpg-xxxx.render.com/cinemanova
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://username:password@host/dbname")
 
 logging.basicConfig(level=logging.INFO)
@@ -27,10 +25,9 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 db_pool = None
 
-# --- DATABASE SOZLAMALARI (POSTGRESQL) ---
+# --- DATABASE SOZLAMALARI ---
 async def init_db():
     global db_pool
-    # Agar Render URL 'postgres://' bilan boshlansa, uni 'postgresql://' ga o'giramiz
     db_url = DATABASE_URL
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -40,7 +37,11 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS channels (
                 id SERIAL PRIMARY KEY,
@@ -74,6 +75,14 @@ async def init_db():
                 stars INT,
                 UNIQUE(user_id, code)
             );
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username TEXT,
+                full_name TEXT,
+                message TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
         """)
 
 # --- FSM STATES ---
@@ -103,12 +112,15 @@ class AddChannelState(StatesGroup):
 class DeleteChannelState(StatesGroup):
     channel_id = State()
 
+class SuggestionState(StatesGroup):
+    text = State()
+
 # --- KLAVIATURALAR ---
 def get_user_keyboard():
     kb = [
         [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="📺 Seriallar")],
         [KeyboardButton(text="🎲 Tasodifiy kino"), KeyboardButton(text="🔥 TOP Kinolar")],
-        [KeyboardButton(text="ℹ️ Bot haqida va qo'llanma")]
+        [KeyboardButton(text="💡 Kino / Taklif yuborish"), KeyboardButton(text="ℹ️ Qo'llanma")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -117,7 +129,8 @@ def get_admin_keyboard():
         [KeyboardButton(text="🎬 Kinolar"), KeyboardButton(text="📺 Seriallar")],
         [KeyboardButton(text="➕ Qo'shish"), KeyboardButton(text="🗑 O'chirish")],
         [KeyboardButton(text="📢 Kanal qo'shish"), KeyboardButton(text="🗑 Kanal o'chirish")],
-        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="📝 Kanallar ro'yxati")]
+        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="💡 Kelgan takliflar")],
+        [KeyboardButton(text="📝 Kanallar ro'yxati")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -163,6 +176,18 @@ def get_sub_inline_kb(channels: list):
     inline_kb.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=inline_kb)
 
+# --- FOYDALANUVCHINI BAZAGA YOZISH / YANGILASH ---
+async def track_user(user: types.User):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, username, full_name, last_active)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                last_active = CURRENT_TIMESTAMP
+        """, user.id, user.username, user.full_name)
+
 # --- START VA ASOSIY MENYU ---
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel_handler(message: types.Message, state: FSMContext):
@@ -174,8 +199,7 @@ async def cancel_handler(message: types.Message, state: FSMContext):
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", message.from_user.id)
+    await track_user(message.from_user)
 
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
@@ -197,6 +221,7 @@ async def start_handler(message: types.Message):
 
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(callback: types.CallbackQuery):
+    await track_user(callback.from_user)
     is_sub, unsub_channels = await check_subscription(callback.from_user.id)
     if is_sub:
         await callback.message.delete()
@@ -207,8 +232,93 @@ async def check_sub_callback(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ Hamma kanallarga a'zo bo'lmadingiz!", show_alert=True)
 
+# --- USER: TAKLIF VA BUYURTMA YUBORISH ---
+@dp.message(F.text == "💡 Kino / Taklif yuborish")
+async def suggest_start(message: types.Message, state: FSMContext):
+    await state.set_state(SuggestionState.text)
+    await message.answer(
+        "✍️ Botga qaysi kino yoki serial qo'shilishini xohlaysiz? Yoki o'z taklifingizni yozib qoldiring:",
+        reply_markup=get_cancel_kb()
+    )
+
+@dp.message(SuggestionState.text)
+async def suggest_finish(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    u = message.from_user
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO suggestions (user_id, username, full_name, message)
+            VALUES ($1, $2, $3, $4)
+        """, u.id, u.username, u.full_name, text)
+
+    # Adminga to'g'ridan-to'g'ri bildirishnoma yuborish
+    admin_msg = (
+        f"💡 **Yangi taklif / buyurtma keldi!**\n\n"
+        f"👤 Kimdan: {u.full_name} (@{u.username if u.username else 'yoq'})\n"
+        f"🆔 ID: `{u.id}`\n\n"
+        f"📝 **Taklif matni:**\n{text}"
+    )
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=admin_msg, parse_mode="Markdown")
+    except Exception:
+        pass
+
+    await state.clear()
+    await message.answer("✅ Taklifingiz adminga yetkazildi. Rahmat!", reply_markup=get_user_keyboard())
+
+# --- ADMIN: KELGAN TAKLIFLARNI KO'RISH ---
+@dp.message(F.text == "💡 Kelgan takliflar", F.from_user.id == ADMIN_ID)
+async def view_suggestions(message: types.Message):
+    async with db_pool.acquire() as conn:
+        suggestions = await conn.fetch("SELECT full_name, username, message, created_at FROM suggestions ORDER BY id DESC LIMIT 10")
+        if not suggestions:
+            await message.answer("Hozircha hech qanday taklif kelmagan.")
+            return
+
+        text = "💡 **Oxirgi kelgan 10 ta taklif va buyurtmalar:**\n\n"
+        for s in suggestions:
+            u_tag = f"@{s['username']}" if s['username'] else "username yo'q"
+            t_str = s['created_at'].strftime("%d.%m %H:%M")
+            text += f"👤 **{s['full_name']}** ({u_tag}) | 🕒 {t_str}\n💬 *{s['message']}*\n────────────────────\n"
+
+        await message.answer(text, parse_mode="Markdown")
+
+# --- ADMIN: KENGAYTIRILGAN STATISTIKA (KUNLIK, HAFTALIK, OYLIK) ---
+@dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
+async def stats_handler(message: types.Message):
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        daily_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '1 day'")
+        weekly_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '7 days'")
+        monthly_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE last_active >= NOW() - INTERVAL '30 days'")
+        
+        movies_count = await conn.fetchval("SELECT COUNT(*) FROM movies")
+        series_count = await conn.fetchval("SELECT COUNT(DISTINCT code) FROM series")
+        
+        recent_users = await conn.fetch("SELECT full_name, username, last_active FROM users ORDER BY last_active DESC LIMIT 10")
+
+    text = (
+        f"📊 **CinemaNova Bot Statistikasi:**\n\n"
+        f"👥 **Foydalanuvchilar:**\n"
+        f"├ 🟢 Bugun faol: **{daily_users}** ta\n"
+        f"├ 📅 Haftalik (7 kun): **{weekly_users}** ta\n"
+        f"├ 🗓 Oylik (30 kun): **{monthly_users}** ta\n"
+        f"└ 👥 Jami a'zolar: **{total_users}** ta\n\n"
+        f"🎬 Kinolar soni: **{movies_count}** ta\n"
+        f"📺 Seriallar soni: **{series_count}** ta\n\n"
+        f"🕒 **Oxirgi faol bo'lgan 10 ta foydalanuvchi:**\n"
+    )
+
+    for u in recent_users:
+        uname = f"@{u['username']}" if u['username'] else "username yo'q"
+        time_str = u['last_active'].strftime("%d.%m %H:%M")
+        text += f"🔹 {u['full_name']} ({uname}) — `{time_str}`\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
 # --- USER TUGMALARI VA QO'LLANMA ---
-@dp.message(F.text == "ℹ️ Bot haqida va qo'llanma")
+@dp.message(F.text == "ℹ️ Qo'llanma")
 async def info_handler(message: types.Message):
     text = (
         "📖 **CinemaNova Bot Qo'llanmasi:**\n\n"
@@ -222,6 +332,7 @@ async def info_handler(message: types.Message):
 # --- KINOLAR RO'YXATI ---
 @dp.message(F.text.contains("Kinolar"))
 async def list_movies(message: types.Message):
+    await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
@@ -249,6 +360,7 @@ async def list_movies(message: types.Message):
 # --- SERIALLAR RO'YXATI ---
 @dp.message(F.text.contains("Seriallar"))
 async def list_series(message: types.Message):
+    await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
@@ -281,6 +393,7 @@ async def list_series(message: types.Message):
 # --- TASODIFIY KINO VA TOP KINOLAR ---
 @dp.message(F.text == "🎲 Tasodifiy kino")
 async def random_movie_handler(message: types.Message):
+    await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
@@ -309,6 +422,7 @@ async def random_movie_handler(message: types.Message):
 
 @dp.message(F.text == "🔥 TOP Kinolar")
 async def top_movies_handler(message: types.Message):
+    await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer("⚠️ Avval kanallarga obuna bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
@@ -337,6 +451,7 @@ async def top_movies_handler(message: types.Message):
 # --- RATING CALLBACK ---
 @dp.callback_query(F.data.startswith("rate_"))
 async def handle_rating(callback: types.CallbackQuery):
+    await track_user(callback.from_user)
     parts = callback.data.split("_")
     code = parts[1]
     stars = int(parts[2])
@@ -351,21 +466,7 @@ async def handle_rating(callback: types.CallbackQuery):
     
     await callback.answer(f"Rahmat! Ushbu kinoga {stars} ⭐ baho berdingiz.", show_alert=True)
 
-# --- ADMIN: STATISTIKA VA KANALLAR ---
-@dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
-async def stats_handler(message: types.Message):
-    async with db_pool.acquire() as conn:
-        users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
-        movies_count = await conn.fetchval("SELECT COUNT(*) FROM movies")
-        series_count = await conn.fetchval("SELECT COUNT(DISTINCT code) FROM series")
-            
-    await message.answer(
-        f"📊 **Bot statistikasi:**\n\n"
-        f"👤 Foydalanuvchilar: {users_count}\n"
-        f"🎬 Kinolar soni: {movies_count}\n"
-        f"📺 Seriallar soni: {series_count}"
-    )
-
+# --- ADMIN: KANALLAR ---
 @dp.message(F.text == "📝 Kanallar ro'yxati", F.from_user.id == ADMIN_ID)
 async def list_channels(message: types.Message):
     async with db_pool.acquire() as conn:
@@ -507,7 +608,7 @@ async def finish_add_movie(message: types.Message, state: FSMContext):
         )
     
     await state.clear()
-    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan bazaga doimiy saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+    await message.answer(f"✅ **\"{data['name']}\"** kinosi `{data['code']}` kodi bilan saqlandi!", reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
 # 2. SERIAL QISMINI QO'SHISH
 @dp.callback_query(F.data == "add_type_series")
@@ -622,6 +723,7 @@ async def delete_content_finish(message: types.Message, state: FSMContext):
 # --- QIDIRUV (KOD BO'YICHA) ---
 @dp.message(F.text)
 async def search_handler(message: types.Message):
+    await track_user(message.from_user)
     is_sub, unsub_channels = await check_subscription(message.from_user.id)
     if not is_sub:
         await message.answer("⚠️ Botdan foydalanish uchun kanallarga a'zo bo'ling:", reply_markup=get_sub_inline_kb(unsub_channels))
@@ -670,6 +772,7 @@ async def search_handler(message: types.Message):
 
 @dp.callback_query(F.data.startswith("ep_"))
 async def send_episode(callback: types.CallbackQuery):
+    await track_user(callback.from_user)
     ep_id = int(callback.data.split("_")[1])
     async with db_pool.acquire() as conn:
         ep = await conn.fetchrow("SELECT name, season, episode, file_id, file_type FROM series WHERE id = $1", ep_id)
